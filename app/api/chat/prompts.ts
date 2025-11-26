@@ -27,3 +27,13 @@ Identify patterns, biases, and psychological factors in the discourse.`,
 } as const;
 
 export type Mode = keyof typeof SYSTEM_PROMPTS;
+
+export const KEYWORD_EXTRACTION_PROMPT = (
+  text: string,
+) => `다음 텍스트에서 뉴스 검색에 사용할 핵심 키워드를 1-3개 추출하세요.
+키워드는 명사 위주로, 검색에 효과적인 단어를 선택하세요.
+응답은 키워드만 쉼표로 구분해서 출력하세요. 다른 설명은 하지 마세요.
+
+텍스트: "${text}"
+
+키워드:`;
