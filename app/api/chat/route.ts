@@ -1,157 +1,148 @@
-import { createOpenAI } from "@ai-sdk/openai";
 import { convertToModelMessages, streamText } from "ai";
+import { extractKeywords } from "./keywords";
+import {
+  formatNewsForContext,
+  type NewsArticle,
+  searchAndCrawlNews,
+} from "./news";
+import { openai } from "./openai";
+import {
+  JSON_STRUCTURE,
+  type Mode,
+  SECURITY_INSTRUCTIONS,
+  SYSTEM_PROMPTS,
+} from "./prompts";
+import {
+  detectInjection,
+  REJECTION_RESPONSE,
+  sanitizeUserInput,
+} from "./security";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 
-const customFetch = async (
-  input: RequestInfo | URL,
-  init?: RequestInit,
-): Promise<Response> => {
-  const response = await fetch(input, init);
-
-  if (!response.ok || !response.body) {
-    return response;
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      let buffer = "";
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-
-          if (done) {
-            if (buffer.trim()) {
-              controller.enqueue(encoder.encode(buffer + "\n"));
-            }
-            break;
-          }
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            controller.enqueue(encoder.encode(processLine(line) + "\n"));
-          }
-        }
-      } catch (err) {
-        controller.error(err);
+const getLastUserMessage = (messages: unknown[]): string => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i] as {
+      role?: string;
+      parts?: { type: string; text: string }[];
+      content?: string;
+    };
+    if (msg.role === "user") {
+      if (msg.parts) {
+        const textPart = msg.parts.find((p) => p.type === "text");
+        if (textPart) return textPart.text;
       }
-
-      controller.close();
-    },
-  });
-
-  const headers = new Headers(response.headers);
-  headers.delete("Content-Length");
-  headers.delete("Content-Encoding");
-
-  return new Response(stream, {
-    headers,
-    status: response.status,
-    statusText: response.statusText,
-  });
-};
-
-const processLine = (line: string): string => {
-  if (!line.startsWith("data: ")) return line;
-
-  const dataStr = line.slice(6);
-  if (dataStr === "[DONE]") return line;
-
-  try {
-    const data = JSON.parse(dataStr);
-
-    if (Array.isArray(data.choices)) {
-      for (const choice of data.choices) {
-        if (
-          choice.delta?.annotations &&
-          !Array.isArray(choice.delta.annotations)
-        ) {
-          delete choice.delta.annotations;
-        }
-      }
+      if (msg.content) return msg.content;
     }
-
-    return `data: ${JSON.stringify(data)}`;
-  } catch {
-    return line;
   }
+  return "";
 };
 
-const openai = createOpenAI({
-  baseURL: "https://api.6r33n.kr/v1",
-  apiKey: process.env.OPENAI_API_KEY,
-  fetch: customFetch,
-});
+const convertToSources = (articles: NewsArticle[]) =>
+  articles.map((article) => ({
+    title: article.title,
+    desc: article.source,
+    url: article.url,
+    type: "news" as const,
+  }));
 
-const JSON_STRUCTURE = `{
-  "verdict": "true" | "false" | "controversial",
-  "confidence": number (0-100),
-  "summary": "string",
-  "sources": [
-    { "title": "string", "desc": "string", "url": "string", "type": "news" | "data" }
-  ]
-}`;
+const fetchNewsContext = async (query: string) => {
+  const keywords = await extractKeywords(query);
+  console.log("Keywords:", keywords);
 
-const SYSTEM_PROMPTS = {
-  "fake-news":
-    "You are a fake news detector. Analyze the input and return a STRICT JSON object.",
-  "crowd-psychology":
-    "You are a crowd psychology analyst. Analyze the input and return a STRICT JSON object.",
-} as const;
+  if (keywords.length === 0) return { context: "", sources: [] };
 
-type Mode = keyof typeof SYSTEM_PROMPTS;
+  const results = await Promise.all(
+    keywords.map((keyword) => searchAndCrawlNews(keyword)),
+  );
+
+  const seenUrls = new Set<string>();
+  const articles = results
+    .flat()
+    .filter((article) => {
+      if (seenUrls.has(article.url)) return false;
+      seenUrls.add(article.url);
+      return true;
+    })
+    .slice(0, 3);
+
+  console.log(`Selected ${articles.length} articles`);
+
+  return {
+    context: articles.length > 0 ? formatNewsForContext(articles) : "",
+    sources: convertToSources(articles),
+  };
+};
+
+const buildSystemPrompt = (
+  mode: Mode,
+  newsContext: string,
+  sources: ReturnType<typeof convertToSources>,
+) => {
+  const basePrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS["fake-news"];
+
+  const contextSection = newsContext
+    ? `\n\nHere are the latest news articles for reference:\n\n${newsContext}\n\nUse the actual URLs from these articles.`
+    : "";
+
+  const sourcesSection =
+    sources.length > 0
+      ? `\n\nUse these news sources:\n${JSON.stringify(sources, null, 2)}`
+      : "";
+
+  return `${SECURITY_INSTRUCTIONS}
+
+${basePrompt}${contextSection}
+
+IMPORTANT: Respond ONLY with valid JSON matching this structure:
+${JSON_STRUCTURE}
+${sourcesSection}
+
+- No markdown code blocks.
+- Korean language for summary/content.
+- Base verdict on provided articles when available.`;
+};
 
 export async function POST(req: Request) {
   try {
     const { messages, mode } = await req.json();
 
     const normalizedMessages = Array.isArray(messages)
-      ? messages.map((message) => {
-          if (message.parts) return message;
-          if (message.content) {
-            return {
-              ...message,
-              parts: [{ type: "text", text: message.content }],
-            };
-          }
-          return message;
-        })
+      ? messages.map((msg) =>
+          msg.parts
+            ? msg
+            : msg.content
+              ? { ...msg, parts: [{ type: "text", text: msg.content }] }
+              : msg,
+        )
       : [];
 
-    const systemPrompt =
-      SYSTEM_PROMPTS[mode as Mode] || SYSTEM_PROMPTS["fake-news"];
+    const userQuery = getLastUserMessage(normalizedMessages);
+
+    if (detectInjection(userQuery)) {
+      console.warn("Injection blocked:", userQuery.slice(0, 50));
+      return Response.json(REJECTION_RESPONSE);
+    }
+
+    const sanitizedQuery = sanitizeUserInput(userQuery);
+
+    const { context, sources } =
+      mode === "fake-news" && sanitizedQuery
+        ? await fetchNewsContext(sanitizedQuery)
+        : { context: "", sources: [] };
 
     const result = await streamText({
       model: openai.chat("gpt-5-mini"),
       messages: convertToModelMessages(normalizedMessages),
-      system: `${systemPrompt}
-
-IMPORTANT: You must respond ONLY with a valid JSON object matching this structure:
-${JSON_STRUCTURE}
-
-- Do not wrap the JSON in markdown code blocks.
-- Do not include any text before or after the JSON.
-- Respond in Korean language for the summary and content.`,
+      system: buildSystemPrompt(mode as Mode, context, sources),
     });
 
     return result.toUIMessageStreamResponse();
   } catch (error) {
     console.error("Chat API Error:", error);
-
-    return new Response(
-      JSON.stringify({ error: "An error occurred processing your request" }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      },
+    return Response.json(
+      { error: "An error occurred processing your request" },
+      { status: 500 },
     );
   }
 }
