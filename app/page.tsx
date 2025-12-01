@@ -1,30 +1,25 @@
 "use client";
 
-import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
 import { useState } from "react";
 import InputArea from "./components/chat/InputArea";
 import MessageBubble from "./components/chat/MessageBubble";
 import Header from "./components/layout/Header";
 import MainLayout from "./components/layout/MainLayout";
+import { api, type ChatResponse } from "./lib/api";
 import { useAppStore } from "./store/useAppStore";
+
+interface Message {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  response?: ChatResponse;
+}
 
 export default function Home() {
   const { mode } = useAppStore();
   const [input, setInput] = useState("");
-
-  const { messages, sendMessage, status } = useChat({
-    transport: new DefaultChatTransport({
-      api: "/api/chat",
-      body: { mode },
-    }),
-    onError: (error) => {
-      console.error("에러 발생:", error);
-      alert("메시지 전송 중 오류가 발생했습니다.");
-    },
-  });
-
-  const isLoading = status === "submitted" || status === "streaming";
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
 
   const handleInputChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
@@ -32,11 +27,41 @@ export default function Home() {
     setInput(e.target.value);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
-    sendMessage({ text: input });
+
+    const userMessage: Message = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: input,
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
     setInput("");
+    setIsLoading(true);
+
+    try {
+      const response = await api.chat.submit({
+        content: input,
+        analysis_type:
+          mode === "fake-news" ? "fake_detection" : "crowd_analysis",
+      });
+
+      const assistantMessage: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: response.result_string || "",
+        response,
+      };
+
+      setMessages((prev) => [...prev, assistantMessage]);
+    } catch (error) {
+      console.error("에러 발생:", error);
+      alert("메시지 전송 중 오류가 발생했습니다.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -82,31 +107,16 @@ export default function Home() {
             </div>
           )}
 
-          {messages
-            .filter((msg) => msg.role !== "system")
-            .map((msg) => {
-              // parts 배열에서 텍스트 추출
-              const content =
-                msg.parts
-                  ?.filter(
-                    (part): part is { type: "text"; text: string } =>
-                      part.type === "text",
-                  )
-                  .map((part) => part.text)
-                  .join("") || "";
+          {messages.map((msg) => (
+            <MessageBubble
+              key={msg.id}
+              role={msg.role}
+              content={msg.content}
+              response={msg.response}
+            />
+          ))}
 
-              return (
-                <MessageBubble
-                  key={msg.id}
-                  role={msg.role === "user" ? "user" : "assistant"}
-                  content={content}
-                />
-              );
-            })}
-
-          {status === "submitted" && (
-            <MessageBubble role="assistant" content="" />
-          )}
+          {isLoading && <MessageBubble role="assistant" content="" />}
         </div>
       </main>
 
