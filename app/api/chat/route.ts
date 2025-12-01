@@ -5,6 +5,7 @@ import { formatNewsForContext, searchAndCrawlNews } from "./news";
 import { openai } from "./openai";
 import { SECURITY_INSTRUCTIONS, SYSTEM_PROMPTS } from "./prompts";
 import { detectInjection, sanitizeUserInput } from "./security";
+import { formatWikiForContext, searchWiki } from "./wiki";
 
 const BACKEND_URL = "https://api.ye0ngjae.com";
 
@@ -54,20 +55,24 @@ async function localAIAnalysis(body: ChatRequest): Promise<ChatResponse> {
 
   const sanitizedContent = sanitizeUserInput(content);
 
-  // 뉴스 검색
+  // 키워드 추출
+  const keywords = await extractKeywords(sanitizedContent);
+
+  // 뉴스 + 위키 검색 (병렬)
   let newsContext = "";
+  let wikiContext = "";
   let sources: string[] = [];
 
-  if (body.analysis_type === "fake_detection") {
-    const keywords = await extractKeywords(sanitizedContent);
-    if (keywords.length > 0) {
-      const results = await Promise.all(
-        keywords.map((keyword) => searchAndCrawlNews(keyword)),
-      );
-      const articles = results.flat().slice(0, 3);
-      newsContext = formatNewsForContext(articles);
-      sources = articles.map((a) => a.url);
-    }
+  if (body.analysis_type === "fake_detection" && keywords.length > 0) {
+    const [newsResults, wikiResults] = await Promise.all([
+      Promise.all(keywords.map((keyword) => searchAndCrawlNews(keyword))),
+      searchWiki(keywords),
+    ]);
+
+    const articles = newsResults.flat().slice(0, 3);
+    newsContext = formatNewsForContext(articles);
+    wikiContext = formatWikiForContext(wikiResults);
+    sources = [...articles.map((a) => a.url), ...wikiResults.map((w) => w.url)];
   }
 
   const mode =
@@ -80,6 +85,8 @@ ${basePrompt}
 
 ${newsContext ? `참고 뉴스:\n${newsContext}` : ""}
 
+${wikiContext ? `참고 위키 자료:\n${wikiContext}` : ""}
+
 다음 JSON 형식으로만 응답하세요:
 {
   "result": "true" | "false" | "controversial",
@@ -89,8 +96,8 @@ ${newsContext ? `참고 뉴스:\n${newsContext}` : ""}
 }
 
 result 판단 기준:
-- "true": 뉴스 기사로 확인된 사실
-- "false": 뉴스 기사와 상반되는 허위 정보
+- "true": 뉴스 기사 또는 위키 자료로 확인된 사실
+- "false": 뉴스 기사나 위키 자료와 상반되는 허위 정보
 - "controversial": 확인할 수 없거나 논란이 있는 주제`;
 
   const { text } = await generateText({
